@@ -518,7 +518,7 @@ def _hf_to_fms_rope(
     )
     for name, param in input_sd.items():
         # hf -> fms requires a transpose operation for the query and key
-        # weight and bias parameters for Llama models
+        # weight and bias parameters for Granite models
         # This transpose is due to the different implementation of RoPE in
         # HF and FMS. While FMS follows the original RoPE paper
         # (https://arxiv.org/abs/2104.09864), HF has its own implementation
