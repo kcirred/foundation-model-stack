@@ -99,6 +99,59 @@ class Alibi(PositionEncoder):
 
         return attn_mask
 
+class YarnScalingImpl:
+    def __init__(
+        self,
+        dim: int,
+        ratio: float = 10_000.0,
+        orig_max_seq_len: int = 2048,
+        scaling_info: dict = defaultdict(),
+    ):
+
+        self.ratio = ratio
+        self.dim = dim
+        self.orig_max_seq_len = orig_max_seq_len
+        self.scaling_info = scaling_info
+
+
+    def get_mscale(self, scale, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    def find_correction_dim(self, num_rotations, dim, ratio, max_position_embeddings):
+        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(ratio))
+
+
+    def compute_scaled_freqs(self, max_position_embeddings: int,device: str, alpha: int):
+        ratio = self.ratio
+        dim = self.dim
+        beta_fast = 32
+        beta_slow = 1
+        factor = max_position_embeddings / self.orig_max_seq_len
+        attention_factor = self.get_mscale(factor)
+
+
+        pos_freqs = ratio ** (torch.arange(0, dim, 2).to(device=device, dtype=torch.float) / dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+        low = math.floor(self.find_correction_dim(beta_fast, dim, ratio, max_position_embeddings))
+        high = math.ceil(self.find_correction_dim(beta_slow, dim, ratio, max_position_embeddings))
+        low = max(low, 0)
+        high = min(high, dim - 1)
+
+        if low == high:
+            high += 0.001
+        linear_func = (torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low).to(device=device, dtype=torch.float)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+
+        inv_freq_extrapolation_factor = 1 - ramp_func
+        inv_freqs = (
+            inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+            + inv_freq_extrapolation * inv_freq_extrapolation_factor
+        )
+        return inv_freqs.to(device), attention_factor
 
 class RopeNoScalingImpl:
     def __init__(
@@ -198,6 +251,7 @@ _rope_scale_mapping = {
     "llama3": RopeLlama3ScalingImpl,
     "ntk": RopeNtkScalingImpl,
     "regular": RopeNoScalingImpl,
+    "yarn": YarnScalingImpl,
 }
 
 
@@ -263,7 +317,7 @@ class RotaryEmbedding(PositionEncoder):
             if scaled_max_seq_len > self.max_seq_len_cached[dev_idx]:
                 # This only runs if a particular combination of alpha
                 # and max_seq_len hasn't been seen before
-                freqs = self.rope_scaling.compute_scaled_freqs(device, alpha)
+                freqs, attention_factor = self.rope_scaling.compute_scaled_freqs(device, alpha)
                 t = torch.arange(scaled_max_seq_len, device=device, dtype=freqs.dtype)
                 freqs = torch.outer(t, freqs).float()
                 self.max_seq_len_cached[dev_idx] = scaled_max_seq_len
@@ -275,8 +329,7 @@ class RotaryEmbedding(PositionEncoder):
                         torch.cos(freqs),
                     ],
                     dim=2,
-                ).view(*freqs.size(), 2, 2)
-
+                ).view(*freqs.size(), 2, 2) * attention_factor
         return alpha
 
     def reshape_for_broadcast(self, x: torch.Tensor, cur_freqs):
